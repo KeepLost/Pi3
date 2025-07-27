@@ -373,3 +373,124 @@ def depth_edge(depth: torch.Tensor, atol: float = None, rtol: float = None, kern
         edge |= (diff / depth).nan_to_num_() > rtol
     edge = edge.reshape(*shape)
     return edge
+
+def recover_intrinsics(local_points, conf,
+                       conf_thresh=0.5,
+                       assume_same_intrinsics=True):
+    """
+    Estimate camera intrinsics (fx, fy, cx, cy) from π³ outputs.
+
+    Args:
+      local_points: torch.Tensor of shape (B, N, H, W, 3)
+                    local XYZ in camera coords.
+      conf:         torch.Tensor of shape (B, N, H, W, 1)
+                    confidence scores [0..1].
+      conf_thresh:  float, only use pixels with conf > thresh.
+      assume_same_intrinsics: bool, if True, pool all views into one estimate per batch.
+
+    Returns:
+      intrinsics: torch.Tensor of shape
+                  (B, 4) if assume_same_intrinsics else (B, N, 4),
+                  columns = [fx, fy, cx, cy].
+    """
+    B, N, H, W, _ = local_points.shape
+
+    # Build pixel grids (u, v) of shape (H, W)
+    device = local_points.device
+    u = torch.linspace(0, W - 1, W, device=device).view(1, 1, 1, W).expand(B, N, H, W)
+    v = torch.linspace(0, H - 1, H, device=device).view(1, 1, H, 1).expand(B, N, H, W)
+
+    # Extract x, y, z, and mask
+    x = local_points[..., 0]
+    y = local_points[..., 1]
+    z = local_points[..., 2]
+    mask = (conf[..., 0] > conf_thresh)
+
+    # Pre‐allocate intrinsics
+    out_shape = (B, 4) if assume_same_intrinsics else (B, N, 4)
+    intrinsics = torch.zeros(out_shape, device=device)
+
+    # Solve per‐batch (pool all views) or per‐view
+    loop_over = range(B) if assume_same_intrinsics else [(b, n)
+                                                         for b in range(B)
+                                                         for n in range(N)]
+
+    for key in loop_over:
+        if assume_same_intrinsics:
+            b = key
+            sel = mask[b].reshape(-1)
+            x_k = x[b].reshape(-1)[sel]
+            y_k = y[b].reshape(-1)[sel]
+            z_k = z[b].reshape(-1)[sel]
+            u_k = u[b].reshape(-1)[sel]
+            v_k = v[b].reshape(-1)[sel]
+        else:
+            b, n = key
+            sel = mask[b, n].reshape(-1)
+            x_k = x[b, n].reshape(-1)[sel]
+            y_k = y[b, n].reshape(-1)[sel]
+            z_k = z[b, n].reshape(-1)[sel]
+            u_k = u[b, n].reshape(-1)[sel]
+            v_k = v[b, n].reshape(-1)[sel]
+
+        # Assemble A and solve for fx, cx from u = (x/z)*fx + cx
+        A_u = torch.stack([x_k / z_k, torch.ones_like(x_k)], dim=1)  # shape (M,2)
+        sol = torch.linalg.lstsq(A_u, u_k.unsqueeze(1)).solution
+        fx, cx = sol[0,0], sol[1,0]
+
+        # Assemble B and solve for fy, cy from v = (y/z)*fy + cy
+        A_v = torch.stack([y_k / z_k, torch.ones_like(y_k)], dim=1)
+        sol_v = torch.linalg.lstsq(A_v, v_k.unsqueeze(1)).solution
+        fy, cy = sol_v[0,0], sol_v[1,0]
+
+        if assume_same_intrinsics:
+            intrinsics[b] = torch.tensor([fx, fy, cx, cy], device=device)
+        else:
+            intrinsics[b, n] = torch.tensor([fx, fy, cx, cy], device=device)
+
+    return intrinsics
+
+def reconstruct_pointcloud(local_points,
+                           camera_poses,
+                           intrinsics):
+    """
+    Reconstruct global 3D points from depth + intrinsics + poses
+
+    Args:
+      local_points:  (B, N, H, W, 3)  as [x, y, z] from model
+      camera_poses:  (B, N, 4, 4)      world<-camera transforms
+      intrinsics:    (B, 4) or (B, N, 4)  tensor of [fx, fy, cx, cy]
+
+    Returns:
+      reconstructed_pts: (B, N, H, W, 3) using K & poses
+    """
+    B, N, H, W, _ = local_points.shape
+    device = local_points.device
+
+    # Unpack intrinsics
+    # allow per‐batch or per‐view
+    if intrinsics.ndim == 2:
+        # (B,4) -> (B,1,4) -> broadcast
+        K = intrinsics.view(B, 1, 4).expand(B, N, 4)
+    else:
+        K = intrinsics  # (B,N,4)
+    fx, fy, cx, cy = K.unbind(-1)  # each is (B,N)
+
+    # Pixel grids
+    u = torch.linspace(0, W - 1, W, device=device)
+    v = torch.linspace(0, H - 1, H, device=device)
+    U = u.view(1, 1, 1, W).expand(B, N, H, W)
+    V = v.view(1, 1, H, 1).expand(B, N, H, W)
+
+    # Depth
+    z = local_points[..., 2]  # (B,N,H,W)
+
+    # Re‐project
+    x_r = (U - cx.view(B, N, 1, 1)) / fx.view(B, N, 1, 1) * z
+    y_r = (V - cy.view(B, N, 1, 1)) / fy.view(B, N, 1, 1) * z
+    hom_new = torch.stack([x_r, y_r, z, torch.ones_like(z)], dim=-1)  # (B,N,H,W,4)
+
+    # Apply poses
+    recon_pts = torch.einsum('bnij,bnhwj->bnhwi', camera_poses, hom_new)[..., :3]
+
+    return recon_pts

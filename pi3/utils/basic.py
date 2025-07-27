@@ -2,29 +2,40 @@ import os
 import os.path as osp
 import math
 import cv2
-from PIL import Image
+from PIL import Image,ImageOps
 import torch
 from torchvision import transforms
 from plyfile import PlyData, PlyElement
 import numpy as np
 
-def load_images_as_tensor(path='data/truck', interval=1, PIXEL_LIMIT=255000):
+def is_image_file(path:str):
+    return path.lower().endswith(('.png', '.jpg', '.jpeg'))
+
+def load_images_as_tensor(path='data/truck', interval=1, PIXEL_LIMIT=255000, keep_mask=True):
     """
     Loads images from a directory or video, resizes them to a uniform size,
     then converts and stacks them into a single [N, 3, H, W] PyTorch tensor.
     """
     sources = [] 
-    
+    mode_rgba=False
     # --- 1. Load image paths or video frames ---
     if osp.isdir(path):
         print(f"Loading images from directory: {path}")
-        filenames = sorted([x for x in os.listdir(path) if x.lower().endswith(('.png', '.jpg', '.jpeg'))])
+        filenames = sorted([x for x in os.listdir(path) if is_image_file(x)])
+        have_masks=keep_mask
         for i in range(0, len(filenames), interval):
             img_path = osp.join(path, filenames[i])
             try:
-                sources.append(Image.open(img_path).convert('RGB'))
+                image=ImageOps.exif_transpose(Image.open(img_path))
+                sources.append(image)
+                have_masks=(have_masks & (image.mode=='RGBA'))
             except Exception as e:
                 print(f"Could not load image {filenames[i]}: {e}")
+        mode_rgba=have_masks
+        if not mode_rgba:
+            sources=[
+                img.convert('RGB') for img in sources
+            ]
     elif path.lower().endswith('.mp4'):
         print(f"Loading frames from video: {path}")
         cap = cv2.VideoCapture(path)
@@ -80,7 +91,10 @@ def load_images_as_tensor(path='data/truck', interval=1, PIXEL_LIMIT=255000):
         return torch.empty(0)
 
     # --- 4. Stack the list of tensors into a single [N, C, H, W] batch tensor ---
-    return torch.stack(tensor_list, dim=0)
+    image_tensors=torch.stack(tensor_list, dim=0)
+    rgb_tensors=image_tensors[:,:3]
+    mask_tensors=image_tensors[:,3:] if mode_rgba else None
+    return rgb_tensors,mask_tensors
 
 
 def tensor_to_pil(tensor):

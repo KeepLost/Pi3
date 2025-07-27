@@ -291,7 +291,8 @@ def run_model(target_dir, model) -> dict:
 
     # interval = 10 if target_dir.endswith('.mp4') else 1
     interval = 1
-    imgs = load_images_as_tensor(os.path.join(target_dir, "images"), interval=interval).to(device) # (N, 3, H, W)
+    imgs,img_masks = load_images_as_tensor(os.path.join(target_dir, "images"), interval=interval) # (N, 3, H, W)
+    imgs=imgs.to(device)
 
     # 3. Infer
     print("Running model inference...")
